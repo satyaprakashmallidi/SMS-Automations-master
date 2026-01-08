@@ -1,0 +1,5 @@
+Name,Phone,Email,Status,Type,Last Service,Address,Total Spent
+Jane Doe,5551234567,jane@example.com,active,Recurring,2024-11-01,"123 Main St Springfield, IL",250
+Luis Patel,5559876543,luis@example.com,active,Residential,2024-10-15,"804 Elm Rd, Austin TX",175
+Amelia Green,5555551212,amelia@example.com,inactive,Recurring,Never,"77 Coastal Hwy, Tampa FL",0
+Noah Reed,5552221189,noah@example.com,active,"Opted-Out",2024-09-20,"455 Market St, San Francisco CA",95.5
