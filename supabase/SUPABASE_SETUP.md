@@ -53,6 +53,30 @@ alter table public.campaigns
 
 ---
 
+### Webhook Logs Table
+
+From `supabase/sql/supabase_webhook_logs_schema.sql`:
+
+- Logs **every** webhook received from Telnyx (message.received, message.sent, message.delivered, message.finalized, etc.)
+- Important columns:
+  - `event_type` – Type of Telnyx event
+  - `direction` – "inbound" or "outbound"
+  - `from_number`, `to_number` – Phone numbers involved
+  - `message_text` – SMS content
+  - `message_id` – Telnyx message ID (for tracking lifecycle)
+  - `status` – Message status (sent, delivered, failed, etc.)
+  - `processed` – Whether this event was routed to user inbox
+  - `user_id` – Which user this was routed to (if any)
+  - `raw_payload` – Full JSON for debugging
+- Use cases:
+  - Debug webhook delivery issues
+  - Track message lifecycle (sent → delivered/failed)
+  - Analytics on message volume and delivery rates
+  - Audit trail for compliance
+- RLS: Service role can write; users can read their own logs
+
+---
+
 ### Customer Conversations Table (Inbox backing store)
 
 From `supabase/sql/supabase_customer_conversations.sql`:
@@ -132,15 +156,26 @@ Environment variables (Edge Function):
 
 ### 2.3 `inbound-message`
 
-- Receives Telnyx webhooks (24/7) for inbound SMS.
+- Receives **ALL** Telnyx webhooks (24/7) for SMS events.
 - Verifies the webhook signature using **Ed25519** with your Telnyx account Public Key (`TELNYX_PUBLIC_KEY`), pulled from Telnyx Mission Control → Account → Keys & Credentials → Public Key.
+- **Logging:** Every webhook (message.received, message.sent, message.delivered, message.finalized, etc.) is logged to `webhook_logs` table for debugging and analytics.
+- **Spam filtering:** Messages marked as `is_spam: true` by Telnyx are logged but NOT routed to inboxes (automatic spam protection).
+- **Processing:** Only `message.received` events (inbound from customers) that are NOT spam are routed to user inboxes. All other events return 200 OK but are only logged.
 - **Smart routing for shared numbers:**
   1. Searches `customers.customers_data` across all users to find existing customer relationship with the sender phone
   2. If found in **multiple users** (e.g., both Alice and Bob messaged this customer), routes message to **ALL matched users' inboxes** (duplicates the message)
   3. If found in **one user**, routes to that user's inbox
   4. If not found (new customer), routes to first user with matching `settings.phone` (Note: `business_phone` is NOT used for inbound routing)
-- Finds or creates a customer by the sender's phone, ensures the `customers` JSON row contains it, and appends an inbound entry to `customer_conversations` (increments `unread_count`).
-- Response shape: `{ success: true, routedTo: 'existing' | 'primary', users: [{userId, customerId}], messageId }`
+- **Customer handling:**
+  - If sender exists in `customers.customers_data`, uses that customer's name and info
+  - If sender is NEW (inbound-only), creates conversation WITHOUT adding to `customers.customers_data`
+  - Inbound-only contacts appear in Direct Messages/Inbox ONLY (not in Customers page)
+  - When user manually adds them to Customers page, they become "full" customers with all fields
+- Appends inbound entry to `customer_conversations` (increments `unread_count`), using phone number as `customer_id`.
+- Response shape: 
+  - For `message.received` (non-spam): `{ success: true, routedTo: 'existing' | 'primary', users: [{userId, customerId}], messageId, logged: true, processed: true }`
+  - For spam messages: `{ success: true, logged: true, processed: false, filtered: true, reason: 'Message marked as spam by Telnyx' }`
+  - For other events: `{ success: true, logged: true, processed: false, eventType, reason: '...' }`
 
 Required secrets:
 

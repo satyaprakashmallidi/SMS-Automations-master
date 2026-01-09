@@ -10,6 +10,7 @@ import {
   ensureCustomerConversations,
   getCustomerConversations,
   deleteCustomerConversations,
+  markConversationAsRead,
 } from '../services/conversationsService'
 import { sendDirectMessage } from '../services/inboxMessagingService'
 
@@ -175,15 +176,57 @@ function InboxPage() {
     setSelectedConversationId(conversations[0].customerId)
   }, [conversations, selectedConversationId])
 
+  // Mark conversation as read when selected
+  useEffect(() => {
+    if (!user?.id || !selectedConversationId) return
+
+    const selectedConv = conversations.find(
+      (conv) => String(conv.customerId) === String(selectedConversationId)
+    )
+
+    // Only mark as read if there are unread messages
+    if (selectedConv && selectedConv.unreadCount > 0) {
+      markConversationAsRead(user.id, selectedConversationId).then(() => {
+        // Update local state to reflect the read status
+        setConversations((prev) =>
+          prev.map((conv) =>
+            String(conv.customerId) === String(selectedConversationId)
+              ? { ...conv, unreadCount: 0, status: conv.status === 'unread' ? 'open' : conv.status }
+              : conv
+          )
+        )
+      }).catch((error) => {
+        console.error('Failed to mark conversation as read:', error)
+      })
+    }
+  }, [selectedConversationId, user?.id])
+
   const activeConversation =
     conversations.find(
       (conv) => String(conv.customerId) === String(selectedConversationId)
     ) || null
 
-  const activeCustomer =
-    customers.find(
-      (customer) => String(customer.id) === String(selectedConversationId)
-    ) || null
+  // Find customer from customers list, or create fallback from conversation data
+  let activeCustomer = customers.find((customer) => {
+    // Match by customer ID
+    if (String(customer.id) === String(selectedConversationId)) return true
+    // Also match by phone number (for inbound-only contacts)
+    const customerPhone = customer.phone || customer.phone_number || customer.phoneNumber
+    if (customerPhone && customerPhone.replace(/\D/g, '') === String(selectedConversationId).replace(/\D/g, '')) {
+      return true
+    }
+    return false
+  })
+
+  // If not found in customers list (inbound-only contact), create from conversation data
+  if (!activeCustomer && activeConversation) {
+    activeCustomer = {
+      id: activeConversation.customerId,
+      name: activeConversation.customerName || `Incoming ${activeConversation.customerId}`,
+      phone: activeConversation.customerId,
+      source: 'inbound',
+    }
+  }
 
   const updateConversationMessages = (conversationId, newMessage) => {
     setConversations((prev) =>

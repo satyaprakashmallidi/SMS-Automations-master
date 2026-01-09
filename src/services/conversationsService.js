@@ -103,6 +103,24 @@ export const ensureCustomerConversations = async (userId, customers = []) => {
   }
 }
 
+export const markConversationAsRead = async (userId, customerId) => {
+  if (!userId || !customerId) return
+
+  try {
+    const { error } = await supabase
+      .from('customer_conversations')
+      .update({ unread_count: 0 })
+      .eq('user_id', userId)
+      .eq('customer_id', String(customerId))
+
+    if (error) {
+      throw error
+    }
+  } catch (error) {
+    console.error('Error marking conversation as read:', error.message)
+  }
+}
+
 export const deleteCustomerConversations = async (userId, customerIds = []) => {
   if (!userId) return
   if (!Array.isArray(customerIds) || customerIds.length === 0) return

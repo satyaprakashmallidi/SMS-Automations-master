@@ -53,10 +53,11 @@ const base64ToUint8Array = (base64: string): Uint8Array => {
   return bytes
 }
 
-async function verifyTelnyxEd25519(req: Request, rawBody: string): Promise<boolean> {
+async function verifyTelnyxEd25519(req: Request, rawBody: string): Promise<{ valid: boolean; error?: string }> {
   if (!telnyxPublicKey) {
-    console.error('TELNYX_PUBLIC_KEY is not set')
-    return false
+    const error = 'TELNYX_PUBLIC_KEY is not set'
+    console.error(error)
+    return { valid: false, error }
   }
 
   const signature =
@@ -72,8 +73,9 @@ async function verifyTelnyxEd25519(req: Request, rawBody: string): Promise<boole
     ''
 
   if (!signature || !timestamp) {
-    console.error('Missing Telnyx signature headers')
-    return false
+    const error = `Missing Telnyx signature headers. sig=${!!signature}, ts=${!!timestamp}`
+    console.error(error)
+    return { valid: false, error }
   }
 
   try {
@@ -92,13 +94,16 @@ async function verifyTelnyxEd25519(req: Request, rawBody: string): Promise<boole
     const isValid = await crypto.subtle.verify('Ed25519', key, signatureBytes, message)
 
     if (!isValid) {
-      console.error('Telnyx signature verification failed')
+      const error = 'Telnyx signature verification failed - signature mismatch'
+      console.error(error)
+      return { valid: false, error }
     }
 
-    return isValid
+    return { valid: true }
   } catch (error) {
-    console.error('Error verifying Telnyx signature (Ed25519)', error)
-    return false
+    const errorMsg = `Error verifying Telnyx signature (Ed25519): ${error}`
+    console.error(errorMsg)
+    return { valid: false, error: errorMsg }
   }
 }
 
@@ -114,6 +119,7 @@ type TelnyxPayload = {
       status?: string
       id?: string
       received_at?: string
+      is_spam?: boolean
     }
     payload?: {
       from?: { phone_number?: string; name?: string }
@@ -122,6 +128,7 @@ type TelnyxPayload = {
       status?: string
       id?: string
       received_at?: string
+      is_spam?: boolean
     }
   }
 }
@@ -140,8 +147,9 @@ const extractMessageDetails = (payload: TelnyxPayload) => {
     record.received_at || payload?.data?.occurred_at || new Date().toISOString()
 
   const fromName = record.from?.name || ''
+  const isSpam = record.is_spam === true
 
-  return { toNumber, fromNumber, messageText, messageId, eventStatus, receivedAt, fromName }
+  return { toNumber, fromNumber, messageText, messageId, eventStatus, receivedAt, fromName, isSpam }
 }
 
 const findAllUsersByExistingCustomer = async (fromNumber: string | null) => {
@@ -212,17 +220,15 @@ const findPrimaryUserForNumber = async (toNumber: string | null) => {
   return match || null
 }
 
-const getOrCreateCustomer = async (
+const findExistingCustomer = async (
   userId: string,
   fromNumber: string,
-  fromName: string,
 ) => {
   const normalizedFrom = normalizePhoneNumber(fromNumber)
-  const fallbackName = fromName || `Incoming ${normalizedFrom || 'customer'}`
 
   const { data: customersRow, error: customersError } = await supabaseAdmin
     .from('customers')
-    .select('id, customers_data')
+    .select('customers_data')
     .eq('user_id', userId)
     .maybeSingle()
 
@@ -230,11 +236,13 @@ const getOrCreateCustomer = async (
     throw customersError
   }
 
-  let customersArray: any[] = Array.isArray(customersRow?.customers_data)
-    ? customersRow?.customers_data
+  if (!customersRow?.customers_data) return null
+
+  const customersArray: any[] = Array.isArray(customersRow.customers_data)
+    ? customersRow.customers_data
     : []
 
-  let matchedCustomer =
+  const matchedCustomer =
     customersArray.find((c) => {
       const candidate =
         c?.phone ||
@@ -244,46 +252,46 @@ const getOrCreateCustomer = async (
       return normalizePhoneNumber(candidate) === normalizedFrom
     }) || null
 
-  if (!matchedCustomer) {
-    matchedCustomer = {
-      id: crypto.randomUUID(),
-      name: fallbackName,
-      phone: fromNumber,
-      status: 'active',
-      source: 'inbound',
-      createdAt: new Date().toISOString(),
-    }
-    customersArray = [...customersArray, matchedCustomer]
+  return matchedCustomer
+}
+
+const logWebhookEvent = async (payload: TelnyxPayload) => {
+  try {
+    const record = payload?.data?.record || payload?.data?.payload || {}
+    const eventType = payload?.data?.event_type || 'unknown'
+    const eventId = payload?.data?.id || null
+    const occurredAt = payload?.data?.occurred_at || record.received_at || new Date().toISOString()
+    const direction = record.direction || null
+    const fromNumber = normalizePhoneNumber(record.from?.phone_number || '')
+    const toNumber = normalizePhoneNumber(record.to?.[0]?.phone_number || '')
+    const messageText = record.text || ''
+    const messageId = record.id || null
+    const isSpam = record.is_spam === true
+    const status = isSpam ? 'spam' : (record.status || record.to?.[0]?.status || eventType)
+
+    await supabaseAdmin.from('webhook_logs').insert({
+      event_type: eventType,
+      event_id: eventId,
+      occurred_at: occurredAt,
+      direction,
+      from_number: fromNumber,
+      to_number: toNumber,
+      message_text: messageText,
+      message_id: messageId,
+      status,
+      processed: false,
+      raw_payload: payload,
+    })
+  } catch (error) {
+    console.error('Failed to log webhook event', error)
+    // Don't throw - logging failure shouldn't stop webhook processing
   }
-
-  if (!customersRow) {
-    const { data, error } = await supabaseAdmin
-      .from('customers')
-      .insert([{ user_id: userId, customers_data: customersArray }])
-      .select('customers_data')
-      .single()
-    if (error) throw error
-    return { customer: matchedCustomer, customersArray: data?.customers_data || customersArray }
-  }
-
-  if (customersArray !== customersRow.customers_data) {
-    const { data, error } = await supabaseAdmin
-      .from('customers')
-      .update({ customers_data: customersArray })
-      .eq('user_id', userId)
-      .select('customers_data')
-      .single()
-
-    if (error) throw error
-    customersArray = data?.customers_data || customersArray
-  }
-
-  return { customer: matchedCustomer, customersArray }
 }
 
 const appendConversationMessage = async ({
   userId,
-  customer,
+  customerPhone,
+  customerName,
   messageText,
   messageId,
   eventStatus,
@@ -291,14 +299,16 @@ const appendConversationMessage = async ({
   rawPayload,
 }: {
   userId: string
-  customer: any
+  customerPhone: string
+  customerName: string
   messageText: string
   messageId: string
   eventStatus: string
   receivedAt: string
   rawPayload: any
 }) => {
-  const customerId = customer?.id ? String(customer.id) : null
+  // Use phone number as the customer_id for conversation tracking
+  const customerId = normalizePhoneNumber(customerPhone)
   if (!customerId) return
 
   const { data: existingRow, error } = await supabaseAdmin
@@ -344,7 +354,7 @@ const appendConversationMessage = async ({
   const payload = {
     user_id: userId,
     customer_id: customerId,
-    customer_name: customer?.name || existingRow?.customer_name || '',
+    customer_name: customerName || existingRow?.customer_name || '',
     messages: nextMessages,
     last_message: messageEntry.content,
     last_message_at: messageEntry.timestamp,
@@ -386,12 +396,21 @@ serve(async (req) => {
 
   const rawBody = await req.text()
 
-  const isVerified = await verifyTelnyxEd25519(req, rawBody)
-  if (!isVerified) {
-    return new Response(JSON.stringify({ error: 'Invalid signature' }), {
-      status: 401,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    })
+  // Verify Telnyx webhook signature
+  const verificationResult = await verifyTelnyxEd25519(req, rawBody)
+  
+  if (!verificationResult.valid) {
+    console.error('Signature verification failed:', verificationResult.error)
+    return new Response(
+      JSON.stringify({
+        error: 'Signature verification failed',
+        details: verificationResult.error,
+      }),
+      {
+        status: 401,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      },
+    )
   }
 
   let payload: TelnyxPayload
@@ -405,8 +424,51 @@ serve(async (req) => {
     })
   }
 
-  const { toNumber, fromNumber, messageText, messageId, eventStatus, receivedAt, fromName } =
+  // STEP 1: Log every webhook event to webhook_logs table
+  await logWebhookEvent(payload)
+
+  const eventType = payload?.data?.event_type || ''
+
+  // STEP 2: Only process message.received events for inbox routing
+  // All other events (message.sent, message.delivered, message.finalized, etc.) are logged but not routed
+  if (eventType !== 'message.received') {
+    console.log('inbound-message: non-inbound event logged', { eventType })
+    return new Response(
+      JSON.stringify({
+        success: true,
+        logged: true,
+        processed: false,
+        eventType,
+        reason: 'Only message.received events are routed to inbox',
+      }),
+      {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      },
+    )
+  }
+
+  // STEP 3: Continue with inbox routing for message.received
+  const { toNumber, fromNumber, messageText, messageId, eventStatus, receivedAt, fromName, isSpam } =
     extractMessageDetails(payload)
+
+  // STEP 3.1: Filter out spam messages
+  if (isSpam) {
+    console.log('inbound-message: spam message filtered', { fromNumber, messageId })
+    return new Response(
+      JSON.stringify({
+        success: true,
+        logged: true,
+        processed: false,
+        filtered: true,
+        reason: 'Message marked as spam by Telnyx',
+      }),
+      {
+        status: 200,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+      },
+    )
+  }
 
   if (!toNumber || !fromNumber) {
     console.error('inbound-message: missing to/from number', {
@@ -439,11 +501,15 @@ serve(async (req) => {
       }
 
       const userId = primaryUserSettings.user_id
-      const { customer } = await getOrCreateCustomer(userId, fromNumber, fromName || '')
+      
+      // Check if customer exists in customers_data (explicitly added by user)
+      const existingCustomer = await findExistingCustomer(userId, fromNumber)
+      const customerName = existingCustomer?.name || fromName || `Incoming ${fromNumber}`
 
       await appendConversationMessage({
         userId,
-        customer,
+        customerPhone: fromNumber,
+        customerName,
         messageText,
         messageId,
         eventStatus,
@@ -451,12 +517,24 @@ serve(async (req) => {
         rawPayload: payload,
       })
 
+      // Mark webhook as processed in logs
+      await supabaseAdmin
+        .from('webhook_logs')
+        .update({
+          processed: true,
+          user_id: userId,
+        })
+        .eq('message_id', messageId)
+        .eq('event_type', 'message.received')
+
       return new Response(
         JSON.stringify({
           success: true,
           routedTo: 'primary',
-          users: [{ userId, customerId: customer?.id }],
+          users: [{ userId, customerId: fromNumber }],
           messageId,
+          logged: true,
+          processed: true,
         }),
         {
           status: 200,
@@ -469,10 +547,12 @@ serve(async (req) => {
     const results = []
     for (const { userSettings, customer } of matchedUsers) {
       const userId = userSettings.user_id
+      const customerName = customer?.name || fromName || `Incoming ${fromNumber}`
 
       await appendConversationMessage({
         userId,
-        customer,
+        customerPhone: fromNumber,
+        customerName,
         messageText,
         messageId,
         eventStatus,
@@ -482,9 +562,19 @@ serve(async (req) => {
 
       results.push({
         userId,
-        customerId: customer?.id,
+        customerId: fromNumber,
       })
     }
+
+    // Mark webhook as processed in logs
+    await supabaseAdmin
+      .from('webhook_logs')
+      .update({
+        processed: true,
+        user_id: results[0]?.userId || null,
+      })
+      .eq('message_id', messageId)
+      .eq('event_type', 'message.received')
 
     return new Response(
       JSON.stringify({
@@ -492,6 +582,8 @@ serve(async (req) => {
         routedTo: 'existing',
         users: results,
         messageId,
+        logged: true,
+        processed: true,
       }),
       {
         status: 200,
