@@ -50,7 +50,7 @@ export const updateSettings = async (userId, data) => {
       first_name: data.firstName,
       last_name: data.lastName,
       email: data.email,
-      phone: data.phone,
+      // phone: data.phone,  // REMOVED: phone is default and cannot be changed
       company_name: data.companyName,
       business_address: data.businessAddress,
       business_phone: data.businessPhone,

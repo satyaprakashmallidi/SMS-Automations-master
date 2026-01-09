@@ -11,6 +11,7 @@ const InputField = forwardRef(function InputField(
     placeholder,
     helperText,
     required,
+    disabled = false,
   },
   ref
 ) {
@@ -33,7 +34,10 @@ const InputField = forwardRef(function InputField(
         value={value}
         onChange={onChange}
         placeholder={placeholder}
-        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm"
+        disabled={disabled}
+        className={`w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm ${
+          disabled ? 'bg-gray-50 text-gray-500 cursor-not-allowed' : ''
+        }`}
       />
       {helperText && <p className="text-xs text-gray-500 mt-1">{helperText}</p>}
     </div>
@@ -49,6 +53,7 @@ InputField.propTypes = {
   placeholder: PropTypes.string,
   helperText: PropTypes.string,
   required: PropTypes.bool,
+  disabled: PropTypes.bool,
 }
 
 export default InputField

@@ -171,8 +171,8 @@ function MessageThread({
 
           <div className="mx-2 flex-shrink-0 text-center">
             <p className="text-[10px] md:text-xs text-gray-500 bg-gray-50 px-1.5 py-0.5 md:px-3 md:py-1 rounded-full border border-gray-100 truncate inline-block">
-              <span className="md:hidden">~$0.0055 / msg</span>
-              <span className="hidden md:inline">It will take around $0.0055 for sending 1 message (160 characters)</span>
+              <span className="md:hidden">~$0.01 / msg</span>
+              <span className="hidden md:inline">It will take around ~$0.01 for sending 1 message (160 characters)</span>
             </p>
           </div>
 

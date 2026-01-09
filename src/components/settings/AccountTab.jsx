@@ -115,6 +115,8 @@ function AccountTab() {
           value={formData.phone}
           onChange={handleChange}
           required
+          disabled
+          helperText="This is your default SMS number for sending and receiving messages. This cannot be changed."
         />
       </div>
 

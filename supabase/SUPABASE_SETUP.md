@@ -130,13 +130,17 @@ Environment variables (Edge Function):
 
 - Sends a single personalized SMS to one customer and records it in `customer_conversations`.
 
-### 2.3 `inbound-message` (new)
+### 2.3 `inbound-message`
 
 - Receives Telnyx webhooks (24/7) for inbound SMS.
-- Verifies the webhook signature with `TELNYX_WEBHOOK_SECRET`.
-- Maps the destination number to the owning user (matches `settings.phone` or `settings.business_phone`).
-- Finds or creates a customer by the sender’s phone, ensures the `customers` JSON row contains it, and appends an inbound entry to `customer_conversations` (increments `unread_count`).
-- Response shape: `{ success: true, userId, customerId, messageId }`
+- Verifies the webhook signature using **Ed25519** with your Telnyx account Public Key (`TELNYX_PUBLIC_KEY`), pulled from Telnyx Mission Control → Account → Keys & Credentials → Public Key.
+- **Smart routing for shared numbers:**
+  1. Searches `customers.customers_data` across all users to find existing customer relationship with the sender phone
+  2. If found in **multiple users** (e.g., both Alice and Bob messaged this customer), routes message to **ALL matched users' inboxes** (duplicates the message)
+  3. If found in **one user**, routes to that user's inbox
+  4. If not found (new customer), routes to first user with matching `settings.phone` (Note: `business_phone` is NOT used for inbound routing)
+- Finds or creates a customer by the sender's phone, ensures the `customers` JSON row contains it, and appends an inbound entry to `customer_conversations` (increments `unread_count`).
+- Response shape: `{ success: true, routedTo: 'existing' | 'primary', users: [{userId, customerId}], messageId }`
 
 Required secrets:
 
@@ -144,7 +148,7 @@ Required secrets:
 npx supabase secrets set SERVICE_ROLE_KEY="..."        # already required
 npx supabase secrets set TELNYX_API_KEY="..."          # already required
 npx supabase secrets set TELNYX_FROM_NUMBER="+1..."    # optional, sending only
-npx supabase secrets set TELNYX_WEBHOOK_SECRET="..."   # new, for inbound verification
+npx supabase secrets set TELNYX_PUBLIC_KEY="..."       # Telnyx Ed25519 public key (keep trailing '=' if present)
 ```
 
 Telnyx webhook endpoint (after deploy):
@@ -153,7 +157,7 @@ Telnyx webhook endpoint (after deploy):
 https://<your-project-ref>.supabase.co/functions/v1/inbound-message
 ```
 
-Configure Telnyx Messaging webhook to POST to that URL with the signing secret above.
+Configure Telnyx Messaging webhook to POST to that URL and use your Telnyx **Public Key** for signature verification.
 
 Key implementation details:
 

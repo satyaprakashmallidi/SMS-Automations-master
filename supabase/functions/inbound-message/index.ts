@@ -3,10 +3,14 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
 const supabaseServiceRoleKey = Deno.env.get('SERVICE_ROLE_KEY') ?? ''
-const telnyxWebhookSecret = Deno.env.get('TELNYX_WEBHOOK_SECRET') ?? ''
+const telnyxPublicKey = Deno.env.get('TELNYX_PUBLIC_KEY') ?? ''
 
 if (!supabaseUrl || !supabaseServiceRoleKey) {
   console.error('Missing Supabase env vars for inbound-message function')
+}
+
+if (!telnyxPublicKey) {
+  console.error('Missing TELNYX_PUBLIC_KEY for inbound-message function')
 }
 
 const supabaseAdmin = createClient(supabaseUrl, supabaseServiceRoleKey, {
@@ -15,7 +19,8 @@ const supabaseAdmin = createClient(supabaseUrl, supabaseServiceRoleKey, {
 
 const corsHeaders: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, telnyx-signature, telnyx-timestamp',
+  'Access-Control-Allow-Headers':
+    'authorization, x-client-info, apikey, content-type, telnyx-signature-ed25519, telnyx-signature, telnyx-timestamp',
 }
 
 const normalizePhoneNumber = (input: string | null | undefined): string | null => {
@@ -36,75 +41,63 @@ const normalizePhoneNumber = (input: string | null | undefined): string | null =
   return `+${digits}`
 }
 
-const toHex = (buffer: ArrayBuffer): string =>
-  Array.from(new Uint8Array(buffer))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-
-const toBase64 = (buffer: ArrayBuffer): string => {
-  const bytes = new Uint8Array(buffer)
-  let binary = ''
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i])
+const base64ToUint8Array = (base64: string): Uint8Array => {
+  // Handles padding '=' correctly; do not trim
+  const cleaned = base64.replace(/-/g, '+').replace(/_/g, '/')
+  const padded = cleaned.padEnd(cleaned.length + ((4 - (cleaned.length % 4)) % 4), '=')
+  const binary = atob(padded)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
   }
-  return btoa(binary)
+  return bytes
 }
 
-const timingSafeEqual = (a: string, b: string): boolean => {
-  const aBytes = new TextEncoder().encode(a)
-  const bBytes = new TextEncoder().encode(b)
-  if (aBytes.length !== bBytes.length) return false
-
-  let result = 0
-  for (let i = 0; i < aBytes.length; i++) {
-    result |= aBytes[i] ^ bBytes[i]
+async function verifyTelnyxEd25519(req: Request, rawBody: string): Promise<boolean> {
+  if (!telnyxPublicKey) {
+    console.error('TELNYX_PUBLIC_KEY is not set')
+    return false
   }
-  return result === 0
-}
 
-async function verifyTelnyxSignature(req: Request, rawBody: string): Promise<boolean> {
-  if (!telnyxWebhookSecret) return true
-
-  const signatureHeader =
+  const signature =
+    req.headers.get('telnyx-signature-ed25519') ||
+    req.headers.get('Telnyx-Signature-Ed25519') ||
     req.headers.get('telnyx-signature') ||
     req.headers.get('Telnyx-Signature') ||
     ''
+
   const timestamp =
     req.headers.get('telnyx-timestamp') ||
     req.headers.get('Telnyx-Timestamp') ||
     ''
 
-  if (!signatureHeader || !timestamp) {
+  if (!signature || !timestamp) {
     console.error('Missing Telnyx signature headers')
     return false
   }
 
   try {
-    const encoder = new TextEncoder()
+    const publicKeyBytes = base64ToUint8Array(telnyxPublicKey.trim())
+    const signatureBytes = base64ToUint8Array(signature.trim())
+
     const key = await crypto.subtle.importKey(
       'raw',
-      encoder.encode(telnyxWebhookSecret),
-      { name: 'HMAC', hash: 'SHA-256' },
+      publicKeyBytes,
+      { name: 'Ed25519', namedCurve: 'Ed25519' },
       false,
-      ['sign'],
+      ['verify'],
     )
 
-    const payload = encoder.encode(`${timestamp}|${rawBody}`)
-    const signatureBuffer = await crypto.subtle.sign('HMAC', key, payload)
+    const message = new TextEncoder().encode(`${timestamp}|${rawBody}`)
+    const isValid = await crypto.subtle.verify('Ed25519', key, signatureBytes, message)
 
-    const computedHex = toHex(signatureBuffer)
-    const computedBase64 = toBase64(signatureBuffer)
-
-    const provided = signatureHeader.trim()
-
-    if (timingSafeEqual(provided, computedHex) || timingSafeEqual(provided, computedBase64)) {
-      return true
+    if (!isValid) {
+      console.error('Telnyx signature verification failed')
     }
 
-    console.error('Telnyx signature verification failed')
-    return false
+    return isValid
   } catch (error) {
-    console.error('Error verifying Telnyx signature', error)
+    console.error('Error verifying Telnyx signature (Ed25519)', error)
     return false
   }
 }
@@ -116,29 +109,89 @@ type TelnyxPayload = {
     occurred_at?: string
     record?: {
       from?: { phone_number?: string; name?: string }
-      to?: Array<{ phone_number?: string }>
+      to?: Array<{ phone_number?: string; status?: string }>
       text?: string
       status?: string
       id?: string
+      received_at?: string
+    }
+    payload?: {
+      from?: { phone_number?: string; name?: string }
+      to?: Array<{ phone_number?: string; status?: string }>
+      text?: string
+      status?: string
+      id?: string
+      received_at?: string
     }
   }
 }
 
 const extractMessageDetails = (payload: TelnyxPayload) => {
-  const record = payload?.data?.record || {}
+  // Support both data.record and data.payload shapes from Telnyx
+  const record = payload?.data?.record || payload?.data?.payload || {}
   const toNumber = normalizePhoneNumber(record.to?.[0]?.phone_number || '')
   const fromNumber = normalizePhoneNumber(record.from?.phone_number || '')
   const messageText = record.text || ''
   const messageId = record.id || payload?.data?.id || crypto.randomUUID()
-  const eventStatus = record.status || payload?.data?.event_type || 'received'
-  const receivedAt = payload?.data?.occurred_at || new Date().toISOString()
+  const toStatus = record.to?.[0]?.status || ''
+  const eventStatus = record.status || toStatus || payload?.data?.event_type || 'received'
+  // Prefer message-level received_at over event-level occurred_at
+  const receivedAt =
+    record.received_at || payload?.data?.occurred_at || new Date().toISOString()
 
   const fromName = record.from?.name || ''
 
   return { toNumber, fromNumber, messageText, messageId, eventStatus, receivedAt, fromName }
 }
 
-const findUserByDestinationNumber = async (toNumber: string | null) => {
+const findAllUsersByExistingCustomer = async (fromNumber: string | null) => {
+  if (!fromNumber) return []
+
+  const matchedUsers: Array<{
+    userSettings: any
+    customer: any
+  }> = []
+
+  // Get all users' customer data
+  const { data: allCustomersRows, error: customersError } = await supabaseAdmin
+    .from('customers')
+    .select('user_id, customers_data')
+
+  if (customersError || !allCustomersRows) {
+    console.error('Error fetching customers for routing', customersError)
+    return []
+  }
+
+  // Check each user's customer list for a match
+  for (const row of allCustomersRows) {
+    if (!row.customers_data || !Array.isArray(row.customers_data)) continue
+
+    const matchedCustomer = (row.customers_data as any[]).find((c) => {
+      const candidate = c?.phone || c?.phone_number || c?.phoneNumber || c?.customerPhone
+      return normalizePhoneNumber(candidate) === fromNumber
+    })
+
+    if (matchedCustomer) {
+      // Found a match - get this user's settings
+      const { data: settingsRow } = await supabaseAdmin
+        .from('settings')
+        .select('user_id, phone, business_phone, sender_name, first_name, last_name, email, company_name')
+        .eq('user_id', row.user_id)
+        .maybeSingle()
+
+      if (settingsRow) {
+        matchedUsers.push({
+          userSettings: settingsRow,
+          customer: matchedCustomer,
+        })
+      }
+    }
+  }
+
+  return matchedUsers
+}
+
+const findPrimaryUserForNumber = async (toNumber: string | null) => {
   if (!toNumber) return null
 
   const { data, error } = await supabaseAdmin
@@ -147,14 +200,13 @@ const findUserByDestinationNumber = async (toNumber: string | null) => {
     .order('updated_at', { ascending: false })
 
   if (error) {
-    console.error('inbound-message: failed to load settings for lookup', error)
+    console.error('inbound-message: failed to load settings for primary user lookup', error)
     return null
   }
 
+  // Only match against the phone field (not business_phone) for inbound routing
   const match = (data || []).find((row) => {
-    const phoneMatch = normalizePhoneNumber(row.phone) === toNumber
-    const businessMatch = normalizePhoneNumber(row.business_phone) === toNumber
-    return phoneMatch || businessMatch
+    return normalizePhoneNumber(row.phone) === toNumber
   })
 
   return match || null
@@ -334,7 +386,7 @@ serve(async (req) => {
 
   const rawBody = await req.text()
 
-  const isVerified = await verifyTelnyxSignature(req, rawBody)
+  const isVerified = await verifyTelnyxEd25519(req, rawBody)
   if (!isVerified) {
     return new Response(JSON.stringify({ error: 'Invalid signature' }), {
       status: 401,
@@ -368,34 +420,77 @@ serve(async (req) => {
   }
 
   try {
-    const userSettings = await findUserByDestinationNumber(toNumber)
-    if (!userSettings?.user_id) {
-      console.error('inbound-message: no user mapped for destination', { toNumber })
-      return new Response(JSON.stringify({ error: 'No user mapped for number' }), {
-        status: 404,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+    // Step 1: Try to find ALL users with existing customer conversation history
+    const matchedUsers = await findAllUsersByExistingCustomer(fromNumber)
+
+    // Step 2: If no existing users found, fallback to primary user for this destination number
+    if (matchedUsers.length === 0) {
+      const primaryUserSettings = await findPrimaryUserForNumber(toNumber)
+
+      if (!primaryUserSettings?.user_id) {
+        console.error('inbound-message: no user mapped for destination', {
+          toNumber,
+          fromNumber,
+        })
+        return new Response(JSON.stringify({ error: 'No user mapped for number' }), {
+          status: 404,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        })
+      }
+
+      const userId = primaryUserSettings.user_id
+      const { customer } = await getOrCreateCustomer(userId, fromNumber, fromName || '')
+
+      await appendConversationMessage({
+        userId,
+        customer,
+        messageText,
+        messageId,
+        eventStatus,
+        receivedAt,
+        rawPayload: payload,
       })
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          routedTo: 'primary',
+          users: [{ userId, customerId: customer?.id }],
+          messageId,
+        }),
+        {
+          status: 200,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        },
+      )
     }
 
-    const userId = userSettings.user_id
+    // Step 3: Append message to ALL matched users' inboxes
+    const results = []
+    for (const { userSettings, customer } of matchedUsers) {
+      const userId = userSettings.user_id
 
-    const { customer } = await getOrCreateCustomer(userId, fromNumber, fromName || '')
+      await appendConversationMessage({
+        userId,
+        customer,
+        messageText,
+        messageId,
+        eventStatus,
+        receivedAt,
+        rawPayload: payload,
+      })
 
-    await appendConversationMessage({
-      userId,
-      customer,
-      messageText,
-      messageId,
-      eventStatus,
-      receivedAt,
-      rawPayload: payload,
-    })
+      results.push({
+        userId,
+        customerId: customer?.id,
+      })
+    }
 
     return new Response(
       JSON.stringify({
         success: true,
-        userId,
-        customerId: customer?.id,
+        routedTo: 'existing',
+        users: results,
         messageId,
       }),
       {
