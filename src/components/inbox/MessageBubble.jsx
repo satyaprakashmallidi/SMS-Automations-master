@@ -3,12 +3,14 @@ import { formatMessageTimeOfDay } from '../../utils/timeFormatters'
 
 const STATUS_META = {
   delivered: { color: 'bg-green-500', label: 'Delivered' },
+  sending: { color: 'bg-amber-500', label: 'Sending' },
   sent: { color: 'bg-amber-500', label: 'Sent' },
   queued: { color: 'bg-amber-500', label: 'Queued' },
   pending: { color: 'bg-amber-500', label: 'Pending' },
   uncertain: { color: 'bg-amber-500', label: 'Uncertain' },
   failed: { color: 'bg-red-500', label: 'Failed' },
   error: { color: 'bg-red-500', label: 'Failed' },
+  delivery_unconfirmed: { color: 'bg-red-500', label: 'Unconfirmed' },
 }
 
 function MessageBubble({ message, senderType, timestamp, status, statusDetails }) {

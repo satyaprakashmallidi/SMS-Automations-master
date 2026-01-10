@@ -284,19 +284,9 @@ const logWebhookEvent = async (payload: TelnyxPayload) => {
     const status = isSpam ? 'spam' : (record.status || record.to?.[0]?.status || eventType)
 
     // For outbound messages, if from_number is null or invalid (e.g., alphanumeric sender ID like "nudge"),
-    // try to find the business phone number from settings
+    // use the shared Telnyx business phone number
     if (!fromNumber && direction === 'outbound') {
-      // Look up business phone from settings (works for single-user setups)
-      const { data: settingsData } = await supabaseAdmin
-        .from('settings')
-        .select('phone, business_phone')
-        .order('updated_at', { ascending: false })
-        .limit(1)
-        .maybeSingle()
-      
-      if (settingsData) {
-        fromNumber = normalizePhoneNumber(settingsData.phone || settingsData.business_phone || '')
-      }
+      fromNumber = '+18334905225'
     }
 
     await supabaseAdmin.from('webhook_logs').insert({
