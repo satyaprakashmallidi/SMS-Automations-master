@@ -220,6 +220,20 @@ const findPrimaryUserForNumber = async (toNumber: string | null) => {
   return match || null
 }
 
+const getAllUsers = async () => {
+  const { data, error } = await supabaseAdmin
+    .from('settings')
+    .select('user_id, phone, business_phone, sender_name, first_name, last_name, email, company_name')
+    .order('created_at', { ascending: true })
+
+  if (error) {
+    console.error('inbound-message: failed to load all users', error)
+    return []
+  }
+
+  return data || []
+}
+
 const findExistingCustomer = async (
   userId: string,
   fromNumber: string,
@@ -262,12 +276,28 @@ const logWebhookEvent = async (payload: TelnyxPayload) => {
     const eventId = payload?.data?.id || null
     const occurredAt = payload?.data?.occurred_at || record.received_at || new Date().toISOString()
     const direction = record.direction || null
-    const fromNumber = normalizePhoneNumber(record.from?.phone_number || '')
+    let fromNumber = normalizePhoneNumber(record.from?.phone_number || '')
     const toNumber = normalizePhoneNumber(record.to?.[0]?.phone_number || '')
     const messageText = record.text || ''
     const messageId = record.id || null
     const isSpam = record.is_spam === true
     const status = isSpam ? 'spam' : (record.status || record.to?.[0]?.status || eventType)
+
+    // For outbound messages, if from_number is null or invalid (e.g., alphanumeric sender ID like "nudge"),
+    // try to find the business phone number from settings
+    if (!fromNumber && direction === 'outbound') {
+      // Look up business phone from settings (works for single-user setups)
+      const { data: settingsData } = await supabaseAdmin
+        .from('settings')
+        .select('phone, business_phone')
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      
+      if (settingsData) {
+        fromNumber = normalizePhoneNumber(settingsData.phone || settingsData.business_phone || '')
+      }
+    }
 
     await supabaseAdmin.from('webhook_logs').insert({
       event_type: eventType,
@@ -290,6 +320,7 @@ const logWebhookEvent = async (payload: TelnyxPayload) => {
 
 const appendConversationMessage = async ({
   userId,
+  customerId,
   customerPhone,
   customerName,
   messageText,
@@ -299,6 +330,7 @@ const appendConversationMessage = async ({
   rawPayload,
 }: {
   userId: string
+  customerId: string | null
   customerPhone: string
   customerName: string
   messageText: string
@@ -307,15 +339,15 @@ const appendConversationMessage = async ({
   receivedAt: string
   rawPayload: any
 }) => {
-  // Use phone number as the customer_id for conversation tracking
-  const customerId = normalizePhoneNumber(customerPhone)
-  if (!customerId) return
+  // Use customer ID if provided (from customers_data), otherwise fall back to phone number
+  const conversationId = customerId || normalizePhoneNumber(customerPhone)
+  if (!conversationId) return
 
   const { data: existingRow, error } = await supabaseAdmin
     .from('customer_conversations')
     .select('id, messages, unread_count, customer_name, status')
     .eq('user_id', userId)
-    .eq('customer_id', customerId)
+    .eq('customer_id', conversationId)
     .maybeSingle()
 
   if (error && error.code !== 'PGRST116') {
@@ -353,7 +385,7 @@ const appendConversationMessage = async ({
 
   const payload = {
     user_id: userId,
-    customer_id: customerId,
+    customer_id: conversationId,
     customer_name: customerName || existingRow?.customer_name || '',
     messages: nextMessages,
     last_message: messageEntry.content,
@@ -485,44 +517,56 @@ serve(async (req) => {
     // Step 1: Try to find ALL users with existing customer conversation history
     const matchedUsers = await findAllUsersByExistingCustomer(fromNumber)
 
-    // Step 2: If no existing users found, fallback to primary user for this destination number
+    // Step 2: If no existing users found, route to ALL users for unknown contact
     if (matchedUsers.length === 0) {
-      const primaryUserSettings = await findPrimaryUserForNumber(toNumber)
+      const allUserSettings = await getAllUsers()
 
-      if (!primaryUserSettings?.user_id) {
-        console.error('inbound-message: no user mapped for destination', {
+      if (!allUserSettings || allUserSettings.length === 0) {
+        console.error('inbound-message: no users found in system', {
           toNumber,
           fromNumber,
         })
-        return new Response(JSON.stringify({ error: 'No user mapped for number' }), {
+        return new Response(JSON.stringify({ error: 'No users in system' }), {
           status: 404,
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         })
       }
 
-      const userId = primaryUserSettings.user_id
+      const results = []
       
-      // Check if customer exists in customers_data (explicitly added by user)
-      const existingCustomer = await findExistingCustomer(userId, fromNumber)
-      const customerName = existingCustomer?.name || fromName || `Incoming ${fromNumber}`
+      // Route message to ALL users as new contact
+      for (const userSettings of allUserSettings) {
+        const userId = userSettings.user_id
+        
+        // Check if customer exists in this user's customers_data
+        const existingCustomer = await findExistingCustomer(userId, fromNumber)
+        const customerName = existingCustomer?.name || fromName || `Incoming ${fromNumber}`
+        const customerId = existingCustomer?.id ? String(existingCustomer.id) : null
 
-      await appendConversationMessage({
-        userId,
-        customerPhone: fromNumber,
-        customerName,
-        messageText,
-        messageId,
-        eventStatus,
-        receivedAt,
-        rawPayload: payload,
-      })
+        await appendConversationMessage({
+          userId,
+          customerId,
+          customerPhone: fromNumber,
+          customerName,
+          messageText,
+          messageId,
+          eventStatus,
+          receivedAt,
+          rawPayload: payload,
+        })
 
-      // Mark webhook as processed in logs
+        results.push({
+          userId,
+          customerId: customerId || fromNumber,
+        })
+      }
+
+      // Mark webhook as processed in logs (use first user for logging)
       await supabaseAdmin
         .from('webhook_logs')
         .update({
           processed: true,
-          user_id: userId,
+          user_id: results[0]?.userId || null,
         })
         .eq('message_id', messageId)
         .eq('event_type', 'message.received')
@@ -530,11 +574,12 @@ serve(async (req) => {
       return new Response(
         JSON.stringify({
           success: true,
-          routedTo: 'primary',
-          users: [{ userId, customerId: fromNumber }],
+          routedTo: 'all-users',
+          users: results,
           messageId,
           logged: true,
           processed: true,
+          note: 'Unknown customer - routed to all users',
         }),
         {
           status: 200,
@@ -548,9 +593,11 @@ serve(async (req) => {
     for (const { userSettings, customer } of matchedUsers) {
       const userId = userSettings.user_id
       const customerName = customer?.name || fromName || `Incoming ${fromNumber}`
+      const customerId = customer?.id ? String(customer.id) : null
 
       await appendConversationMessage({
         userId,
+        customerId,
         customerPhone: fromNumber,
         customerName,
         messageText,
@@ -562,7 +609,7 @@ serve(async (req) => {
 
       results.push({
         userId,
-        customerId: fromNumber,
+        customerId: customerId || fromNumber,
       })
     }
 
@@ -579,11 +626,13 @@ serve(async (req) => {
     return new Response(
       JSON.stringify({
         success: true,
-        routedTo: 'existing',
+        routedTo: 'matched-users',
         users: results,
+        userCount: results.length,
         messageId,
         logged: true,
         processed: true,
+        note: `Message routed to ${results.length} user(s) with this customer saved`,
       }),
       {
         status: 200,
